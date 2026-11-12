@@ -1,0 +1,312 @@
+# Refit every observation with the optimally binned spectra (_sr_opt.pha),
+# starting from the fits already saved in Ring/.
+#
+# For each nu<obsID>A01_sr_opt.pha with a matching B01 spectrum in datadir:
+#   - builds the same model as fit_all_ring.xcm, then sets every parameter
+#     (value, limits, frozen or free) from Ring/<obsID>_stage2.xcm
+#   - fits with C-stat (W-stat with the background), retests whether A_Fe and
+#     Dens are needed if they were frozen, and recomputes the 90 % errors
+#   - observations without a usable saved fit go through the full staged
+#     procedure instead
+#
+# Writes, in datadir:
+#   Ring/<obsID>_opt.xcm      final fit (saved before the error runs, then after)
+#   Ring/<obsID>_opt.ps       unfolded spectrum and residuals
+#   Ring/<obsID>_opt.log      everything XSPEC printed for that observation
+#   Images/<obsID>.gif        the same plot as an image
+#   Ring/summary.csv          each refitted observation's row replaced; the
+#                             previous version is first kept as summary_1000.csv
+#
+# Interactive:  XSPEC12> @refit_all_ring_opt.xcm
+# Batch:        set batch to 1, then  nohup xspec - refit_all_ring_opt.xcm > refit_opt.out 2>&1 &
+
+# settings
+
+set datadir  "/Users/er19801/data"
+set xillver  "/Users/er19801/JuliaXSPEC.jl/xillverD-5.fits"
+set suffix   "_sr_opt.pha"
+set fitstat  cstat
+set nH       0.86
+set redshift 0.0
+set batch    0
+set libdir   "/Users/er19801/JuliaXSPEC.jl/build/kerrz/xspec"
+set obsids   {}           ;# leave empty to refit every observation in datadir
+
+# setup
+
+if {$batch} { lmod juliaxspec $libdir }
+cd $datadir
+file mkdir Ring
+file mkdir Images
+query yes
+abund wilm
+xsect vern
+setplot energy
+setplot add
+setplot rebin 20 40
+energies 0.05 1000 5000 log
+
+# White background for the GIF images (PGPLOT's default is black)
+set env(PGPLOT_BACKGROUND) white
+set env(PGPLOT_FOREGROUND) black
+
+set summary_params {3 Tin 5 PhoIndex 6 HighECut 8 a 9 inc 10 h 11 x 13 A_Fe 14 logXi 15 Dens}
+
+# helpers
+
+proc append_line {path text} {
+    set ch [open $path a]
+    puts $ch $text
+    close $ch
+}
+
+# Replace obsid's row in a CSV file (or add it), keeping the other rows
+proc update_summary {path header row} {
+    set lines {}
+    if {[file exists $path]} {
+        set ch [open $path r]
+        foreach line [split [read $ch] "\n"] {
+            if {[string trim $line] ne ""} { lappend lines $line }
+        }
+        close $ch
+    }
+    if {[llength $lines] == 0} { set lines [list $header] }
+    set id [lindex [split $row ","] 0]
+    set out [list [lindex $lines 0]]
+    set found 0
+    foreach line [lrange $lines 1 end] {
+        if {[lindex [split $line ","] 0] eq $id} {
+            lappend out $row
+            set found 1
+        } else {
+            lappend out $line
+        }
+    }
+    if {!$found} { lappend out $row }
+    set ch [open $path w]
+    foreach line $out { puts $ch $line }
+    close $ch
+}
+
+# The parameter lines of an XSPEC save file (the lines after its "model"
+# line): each "value delta min bot top max" as a list, or "" for a link.
+proc read_saved_params {path} {
+    set ch [open $path r]
+    set lines [split [read $ch] "\n"]
+    close $ch
+    set values {}
+    set in_params 0
+    foreach line $lines {
+        set line [string trim $line]
+        if {!$in_params} {
+            if {[string match "model *" $line]} { set in_params 1 }
+            continue
+        }
+        if {[string match "=*" $line]} {
+            lappend values ""
+        } elseif {[llength $line] >= 6 && [string is double -strict [lindex $line 0]]} {
+            lappend values [lrange $line 0 5]
+        } else {
+            break
+        }
+    }
+    return $values
+}
+
+# The model of fit_all_ring.xcm, with its links and limits. Sets the globals
+# per (parameters per data group), p_xnorm and c2 (FPMB's constant).
+proc build_model {} {
+    global xspec_tclout xillver nH redshift per p_xnorm c2
+    model constant*tbabs*(diskbb + cutoffpl + kzring*atable{$xillver}) & /*
+    tclout modpar
+    set npar $xspec_tclout
+    if {$npar == 17 || $npar == 34} {
+        set per 17
+    } else {
+        set per 18
+        newpar 17 $redshift -1
+    }
+    set p_xnorm $per
+    set c2 [expr {$per + 1}]
+
+    newpar 1 1.0 -1
+    untie $c2
+    newpar $c2 1.0 0.01 0.5 0.8 1.2 1.5
+    newpar 2 $nH -1
+    newpar 3 1.0 0.01 0.1 0.1 3.0 3.0
+    newpar 4 1000 1
+
+    tclout param 12
+    set gmin [lindex $xspec_tclout 2]
+    set gmax [lindex $xspec_tclout 5]
+    tclout param 16
+    set imin [expr {max(5.0, [lindex $xspec_tclout 2])}]
+    set imax [expr {min(85.0, [lindex $xspec_tclout 5])}]
+
+    newpar 5 2.0 0.01 $gmin $gmin $gmax $gmax
+    newpar 6 100 1 10 10 500 500
+    newpar 7 1.0 0.01
+    newpar 8 0.9 0.01
+    newpar 9 30 1 $imin $imin $imax $imax
+    newpar 10 5 0.1
+    newpar 11 4 0.1
+    newpar 12 = p5
+    newpar 13 1.0 -1
+    newpar 14 3.0 0.1
+    newpar 15 15 -1
+    newpar 16 = p9
+}
+
+# Set every parameter from a saved fit; the links (Gamma, Incl, FPMB
+# following FPMA) are kept as build_model made them.
+proc apply_saved {entries} {
+    global per c2
+    for {set j 1} {$j <= $per} {incr j} {
+        set e [lindex $entries [expr {$j - 1}]]
+        if {$j == 12 || $j == 16 || [llength $e] != 6} { continue }
+        eval newpar $j $e
+    }
+    set e [lindex $entries $per]
+    if {[llength $e] == 6} { eval newpar $c2 $e }
+}
+
+# The staged procedure of fit_all_ring.xcm, for observations with no saved fit
+proc staged_fit {} {
+    global xspec_tclout p_xnorm
+    newpar $p_xnorm 0 -1
+    freeze 8 9 10 11 14
+    ignore 1-2:4.0-8.0 12.0-40.0
+    fit 500
+    notice 1-2:4.0-8.0 12.0-40.0
+    ignore bad
+    tclout param 7
+    newpar $p_xnorm [expr {0.01 * [lindex $xspec_tclout 0]}] 0.01
+    thaw 14
+    fit 500
+    thaw 8 9 10 11
+    fit 1000
+}
+
+# one observation
+
+proc refit_obs {obsid} {
+    global xspec_tclout suffix fitstat summary_params per c2
+
+    data none
+    model clear
+    data 1:1 nu${obsid}A01${suffix} 2:2 nu${obsid}B01${suffix}
+    ignore bad
+    ignore 1-2:**-3.0 80.0-**
+    statistic $fitstat
+
+    build_model
+
+    set saved Ring/${obsid}_stage2.xcm
+    set entries {}
+    if {[file exists $saved] && ![catch {read_saved_params $saved} entries] \
+            && [llength $entries] == 2 * $per} {
+        puts "Starting from $saved"
+        apply_saved $entries
+        fit 1000
+    } else {
+        puts "No usable saved fit for $obsid: fitting in stages from the defaults"
+        staged_fit
+    }
+
+    # A_Fe and Dens: kept as they were if free, retested if frozen
+    tclout param 13
+    if {[lindex $xspec_tclout 1] > 0} {
+        set fe_dens_free 1
+    } else {
+        tclout stat
+        set stat_fixed $xspec_tclout
+        thaw 13 15
+        fit 1000
+        tclout stat
+        set improvement [expr {$stat_fixed - $xspec_tclout}]
+        puts "Improvement from freeing A_Fe and Dens: $improvement"
+        if {$improvement >= 5.99} {
+            set fe_dens_free 1
+        } else {
+            tclout param 15
+            set dens_min [lindex $xspec_tclout 2]
+            newpar 13 1.0 -1
+            newpar 15 $dens_min -1
+            fit 1000
+            set fe_dens_free 0
+        }
+    }
+    show fit
+
+    file delete -force Ring/${obsid}_opt.xcm
+    save all Ring/${obsid}_opt.xcm
+
+    error 2.706 3 6 8 9 10 11 14 $c2
+    if {$fe_dens_free} { error 2.706 13 15 }
+
+    file delete -force Ring/${obsid}_opt.xcm
+    save all Ring/${obsid}_opt.xcm
+
+    cpd Ring/${obsid}_opt.ps/cps
+    plot eeufspec delchi
+    if {[catch {cpd Images/${obsid}.gif/gif; plot eeufspec delchi} err]} {
+        puts "Could not write Images/${obsid}.gif: $err"
+    }
+    cpd none
+
+    tclout stat
+    set row [list $obsid $xspec_tclout]
+    tclout dof
+    lappend row [lindex $xspec_tclout 0] $fe_dens_free
+    foreach {p name} [concat $summary_params [list $c2 const_B]] {
+        tclout param $p
+        set value [lindex $xspec_tclout 0]
+        set delta [lindex $xspec_tclout 1]
+        tclout error $p
+        set lo [lindex $xspec_tclout 0]
+        set hi [lindex $xspec_tclout 1]
+        if {$delta < 0} { set lo ""; set hi "" }
+        lappend row $value $lo $hi
+    }
+    return [join $row ","]
+}
+
+# all observations
+
+if {[llength $obsids] == 0} {
+    foreach f [lsort [glob -nocomplain nu*A01${suffix}]] {
+        set id [string range $f 2 end-[string length "A01${suffix}"]]
+        if {[file exists nu${id}B01${suffix}]} {
+            lappend obsids $id
+        } else {
+            puts "Skipping $f: no matching FPMB spectrum"
+        }
+    }
+}
+puts "Observations to refit: $obsids"
+
+set header [list obsid stat dof fe_dens_free]
+foreach {p name} [concat $summary_params [list c2 const_B]] {
+    lappend header $name ${name}_lo ${name}_hi
+}
+set header [join $header ","]
+
+if {[file exists Ring/summary.csv] && ![file exists Ring/summary_1000.csv]} {
+    file copy Ring/summary.csv Ring/summary_1000.csv
+}
+
+foreach id $obsids {
+    puts "\n================ $id ================"
+    file delete -force Ring/${id}_opt.log
+    log Ring/${id}_opt.log
+    if {[catch {refit_obs $id} result]} {
+        puts "FAILED: $id: $result"
+        update_summary Ring/summary.csv $header "$id,failed"
+    } else {
+        update_summary Ring/summary.csv $header $result
+    }
+    log none
+}
+puts "\nDone: fits in $datadir/Ring/, images in $datadir/Images/"
+
+if {$batch} { exit }
